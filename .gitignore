@@ -3,3 +3,4 @@ venv
 chainlit.db
 chainlit.md
 db
+test_db.ipynb

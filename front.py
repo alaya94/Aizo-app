@@ -157,10 +157,7 @@ data_layer = SyncSQLAlchemyDataLayer(
     conninfo=STORAGE_PATH,
     storage_provider=storage_provider
 )
-# data_layer = SQLAlchemyDataLayer(
-#     conninfo=STORAGE_PATH,
-#     storage_provider=storage_provider
-# )
+
 
 @cl.data_layer
 def get_data_layer():
@@ -213,7 +210,6 @@ async def main(message: cl.Message):
                     try:
                         with open(element.path, 'rb') as f:
                             files = {'file': (element.name, f, element.mime)}
-                            # Send to Backend
                             async with httpx.AsyncClient(timeout=60.0) as client:
                                 response = await client.post(
                                     f"{BACKEND_URL}/upload/{thread_id}",
@@ -231,21 +227,34 @@ async def main(message: cl.Message):
             await cl.Message(content="✅ Document processed. You can now ask questions about it!").send()
             return
 
-    # 3. Chat with Backend
+    # 3. Stream Chat from Backend (THE NEW PART)
     msg = cl.Message(content="")
+    await msg.send() # Send an empty message first to create the UI placeholder
+
     try:
         async with httpx.AsyncClient(timeout=60.0) as client:
-            response = await client.post(
+            # Use client.stream to open a persistent connection
+            async with client.stream(
+                "POST",
                 f"{BACKEND_URL}/chat",
                 json={"message": message.content, "thread_id": thread_id}
-            )
+            ) as response:
+                
+                # Check if backend is happy
+                if response.status_code != 200:
+                    error_text = await response.read()
+                    msg.content = f"⚠️ **Backend Error:** {error_text.decode()}"
+                    await msg.update()
+                    return
 
-        if response.status_code == 200:
-            msg.content = response.json().get("response", "")
-        else:
-            msg.content = f"⚠️ **Backend Error:** {response.text}"
+                # Iterate over the text chunks as they arrive
+                async for chunk in response.aiter_text():
+                    if chunk:
+                        await msg.stream_token(chunk)
 
     except Exception as e:
-        msg.content = f"❌ **Error:** {str(e)}"
+        msg.content = f"❌ **Connection Error:** {str(e)}"
+        await msg.update()
         
-    await msg.send()
+    # Finalize the message after the stream ends
+    await msg.update()

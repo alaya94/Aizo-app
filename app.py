@@ -24,6 +24,7 @@ from langgraph.graph.message import add_messages
 from langchain_core.documents import Document
 from langchain_community.document_loaders import Docx2txtLoader, UnstructuredImageLoader
 import base64
+from fastapi.responses import StreamingResponse
 load_dotenv(override=True)
 
 # --- CONFIG ---
@@ -181,22 +182,30 @@ class ChatRequest(BaseModel):
 async def chat_endpoint(request: ChatRequest):
     if not graph: raise HTTPException(503, "Graph loading...")
     
-    print(f"\n📩 [DEBUG] Received Chat: {request.message} (Thread: {request.thread_id})")
+    print(f"\n💬 [DEBUG] Streaming Chat: {request.message} (Thread: {request.thread_id})")
     
     config = {"configurable": {"thread_id": request.thread_id}}
     inputs = {"messages": [HumanMessage(content=request.message)]}
     
-    final_res = "Error"
-    try:
-        async for event in graph.astream(inputs, config=config, stream_mode="values"):
-            msg = event["messages"][-1]
-            if isinstance(msg, AIMessage) and msg.content:
-                final_res = msg.content
-    except Exception as e:
-        print(f"❌ [DEBUG] Graph Execution Error: {e}")
-        return {"response": f"Error: {e}"}
-        
-    return {"response": final_res}
+    async def event_generator():
+        try:
+            # astream_events (v2) allows us to see everything happening inside the Agent
+            async for event in graph.astream_events(inputs, config=config, version="v2"):
+                
+                # We filter for "on_chat_model_stream" to get tokens from GPT-4
+                if event["event"] == "on_chat_model_stream":
+                    chunk = event["data"]["chunk"]
+                    
+                    # Only yield if there is actual text content (avoids empty chunks from Tool Calls)
+                    if chunk.content:
+                        yield chunk.content
+                        
+        except Exception as e:
+            print(f"❌ [DEBUG] Stream Error: {e}")
+            yield f"Error: {str(e)}"
+
+    # Return the generator as a StreamingResponse
+    return StreamingResponse(event_generator(), media_type="text/plain")
 
 @app.post("/upload/{thread_id}")
 async def upload_file(thread_id: str, file: UploadFile = File(...)):
