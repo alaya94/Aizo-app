@@ -45,7 +45,9 @@ vector_stores = {}
 # --- PROMPTS ---
 
 PROFILE_INSTRUCTIONS = """
-You are a memory manager. Your job is to update a profile of the user based on the new conversation.
+You are a memory manager for Aizo, a Digital Transformation expert. 
+Your job is to update the professional profile of the user.
+
 Current Profile:
 {history}
 
@@ -53,11 +55,10 @@ New conversation lines:
 {new_lines}
 
 INSTRUCTIONS:
-- Extract specific facts, preferences, names, and project details.
-- Merge them into the Current Profile.
-- If the new information conflicts with old info, update it (assume new is correct).
-- Keep the output as a concise bulleted list of facts about the user.
-- DO NOT include the conversation history itself, only the facts derived from it.
+- Extract ONLY professional details: Job Title, Industry, Company Goals, Technical Stack, Challenges, and Digital Strategy preferences.
+- IGNORE personal trivia (e.g., pets, food, hobbies) unless it relates to their business persona.
+- Merge new facts into the Current Profile.
+- Keep the output as a concise bulleted list.
 """
 
 # --- TOOLS (Unchanged) ---
