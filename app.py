@@ -1,30 +1,30 @@
 import os
 import uvicorn
 import shutil
-from typing import List, TypedDict, Annotated
+from typing import List, TypedDict, Annotated, Optional
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from dotenv import load_dotenv
 
-# LangChain / LangGraph
+# LangChain / LangGraph Imports
 from redis.asyncio import Redis
 from langgraph.checkpoint.redis.aio import AsyncRedisSaver
 from langchain_openai import ChatOpenAI, OpenAIEmbeddings
-from langchain_community.document_loaders import PyPDFLoader, TextLoader
+from langchain_community.document_loaders import PyPDFLoader, TextLoader, Docx2txtLoader, UnstructuredImageLoader
+from langchain_core.documents import Document
 from langchain_community.vectorstores import Chroma
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_core.tools import tool
-from langchain_core.messages import BaseMessage, HumanMessage, AIMessage, SystemMessage
+from langchain_core.messages import BaseMessage, HumanMessage, AIMessage, SystemMessage, RemoveMessage
 from langchain_core.runnables import RunnableConfig
-from langgraph.graph import StateGraph
+from langgraph.graph import StateGraph, END
 from langgraph.prebuilt import ToolNode, tools_condition
 from langgraph.graph.message import add_messages
-from langchain_core.documents import Document
-from langchain_community.document_loaders import Docx2txtLoader, UnstructuredImageLoader
 import base64
-from fastapi.responses import StreamingResponse
+import tiktoken
+
 load_dotenv(override=True)
 
 # --- CONFIG ---
@@ -32,6 +32,8 @@ REDIS_URL = os.environ.get("REDIS_URL", "redis://localhost:6379")
 UPLOAD_DIR = "./uploads"
 DB_DIR = "./db"
 PORT = 8001
+MAX_FILE_SIZE_MB = 10
+ALLOWED_EXTENSIONS = {".pdf", ".txt", ".docx", ".png", ".jpg", ".jpeg"}
 
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 os.makedirs(DB_DIR, exist_ok=True)
@@ -39,10 +41,32 @@ os.makedirs(DB_DIR, exist_ok=True)
 redis_client = None 
 graph = None        
 vector_stores = {}
-MAX_FILE_SIZE_MB = 10
-ALLOWED_EXTENSIONS = {".pdf", ".txt", ".docx", ".png", ".jpg", ".jpeg"}
-# --- TOOLS ---
 
+# --- PROMPTS ---
+
+PROFILE_INSTRUCTIONS = """
+You are a memory manager. Your job is to update a profile of the user based on the new conversation.
+Current Profile:
+{history}
+
+New conversation lines:
+{new_lines}
+
+INSTRUCTIONS:
+- Extract specific facts, preferences, names, and project details.
+- Merge them into the Current Profile.
+- If the new information conflicts with old info, update it (assume new is correct).
+- Keep the output as a concise bulleted list of facts about the user.
+- DO NOT include the conversation history itself, only the facts derived from it.
+"""
+
+# --- TOOLS (Unchanged) ---
+def count_tokens(text: str, model: str = "gpt-4o") -> int:
+    try:
+        encoding = tiktoken.encoding_for_model(model)
+    except KeyError:
+        encoding = tiktoken.get_encoding("cl100k_base")
+    return len(encoding.encode(text))
 def get_vector_store(session_id: str):
     path = os.path.join(DB_DIR, session_id)
     if session_id not in vector_stores:
@@ -53,106 +77,219 @@ def get_vector_store(session_id: str):
         )
     return vector_stores[session_id]
 
-
-async def describe_image(file_path: str) -> str:
-    """
-    Uses GPT-4o-mini to look at the image and describe it textually
-    so we can store it in the vector DB.
-    """
-    with open(file_path, "rb") as image_file:
-        encoded_string = base64.b64encode(image_file.read()).decode('utf-8')
-    
-    # We use a direct LLM call here, distinct from the agent
-    vision_llm = ChatOpenAI(model="gpt-4o-mini", max_tokens=1000)
-    
-    msg = HumanMessage(
-        content=[
-            {"type": "text", "text": "Analyze this image. Extract all visible text verbatim. If there are charts or graphs, describe the data trends in detail. Output ONLY the description."},
-            {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{encoded_string}"}}
-        ]
-    )
-    
-    res = await vision_llm.ainvoke([msg])
-    return res.content
-
 @tool
 def lookup_documents(query: str, config: RunnableConfig) -> str:
-    """Search uploaded documents (PDFs, Word, Text) AND image descriptions.
-    ALWAYS use this tool if the user asks about "this image", "the screenshot", "the graph", or "the document"."""
-    print(f"\n🔎 [DEBUG] Tool 'lookup_documents' called with query: '{query}'")
-    
+    """Search uploaded documents (PDFs, Word, Text) AND image descriptions."""
+    print(f"\n🔎 [DEBUG] Tool 'lookup_documents' called: '{query}'")
     session_id = config.get("configurable", {}).get("thread_id")
-    if not session_id: 
-        print("❌ [DEBUG] No session ID found in config.")
-        return "No session ID."
-        
+    if not session_id: return "No session ID."
     try:
         store = get_vector_store(session_id)
-        # Debug: Check how many docs are in store
-        count = store._collection.count()
-        print(f"📊 [DEBUG] Vector Store for '{session_id}' has {count} chunks.")
-        
         docs = store.similarity_search(query, k=3)
-        
-        if not docs:
-            print("⚠️ [DEBUG] Search returned NO results.")
-            return "No relevant information found in the documents."
-            
-        print(f"✅ [DEBUG] Found {len(docs)} relevant chunks.")
-        return "\n\n".join([d.page_content for d in docs])
+        return "\n\n".join([d.page_content for d in docs]) if docs else "No info found."
     except Exception as e:
-        print(f"❌ [DEBUG] Tool Error: {e}")
         return f"Error: {e}"
 
-@tool
-async def remember_fact(fact: str, config: RunnableConfig) -> str:
-    """Store user details (name, preferences) to memory."""
-    global redis_client
-    thread_id = config.get("configurable", {}).get("thread_id")
-    if not thread_id or not redis_client: return "Memory unavailable."
-    await redis_client.rpush(f"memory:{thread_id}", fact)
-    return f"Stored: {fact}"
-
-# --- WORKFLOW ---
+# --- STATE DEFINITION ---
 
 class AgentState(TypedDict):
+    # add_messages handles the append logic
     messages: Annotated[List[BaseMessage], add_messages]
+    # summary holds the Short-Term context summary
+    summary: str
 
+# --- NODES ---
+
+# 1. CHATBOT NODE (Consumes Memories)
 async def chatbot(state: AgentState, config: RunnableConfig):
-    thread_id = config.get("configurable", {}).get("thread_id")
+    # Helper to get User ID (for Profile) and Thread ID (for Vector Store)
+    conf = config.get("configurable", {})
+    thread_id = conf.get("thread_id")
+    user_id = "admin" # In a real app, pass this in config. For now, we default to admin.
+
+    # A. FETCH LONG-TERM PROFILE (User Scoped)
+    user_profile = ""
+    if redis_client:
+        # Note: Key is based on USER_ID, not THREAD_ID. This is shared memory!
+        user_profile = await redis_client.get(f"user_profile:{user_id}")
+        if not user_profile:
+            user_profile = "No profile yet."
     
-    memories = []
-    if thread_id and redis_client:
-        memories = await redis_client.lrange(f"memory:{thread_id}", 0, -1)
-    
-    memory_text = "\n".join([f"- {m}" for m in memories]) if memories else "No memories yet."
-    
-    # STRONGER SYSTEM PROMPT
+    # B. FETCH SHORT-TERM SUMMARY (Thread Scoped)
+    short_term_context = state.get("summary", "")
+
+    # C. CONSTRUCT SYSTEM PROMPT
+# ... inside chatbot function ...
+
+    # C. CONSTRUCT SYSTEM PROMPT (THE AIZO PERSONALITY)
     system_prompt = (
-        "You are a helpful AI assistant with access to a file database.\n"
-        "IMPORTANT: The user may upload 'images' or 'screenshots'. These have been converted to text descriptions "
-        "and stored in your document database.\n"
-        "RULE: If the user asks about 'this image', 'the graph', 'the screenshot', or 'what did I upload', "
-        "you MUST use the 'lookup_documents' tool to find the description. Do NOT say you cannot see images.\n\n"
-        f"LONG-TERM MEMORY:\n{memory_text}"
+        "### IDENTITY ###\n"
+        "Your name is **Aizo**. You are a Senior Consultant and Expert in **Digital Transformation**.\n"
+        "You are professional, insightful, and strategic. You speak with the authority of a CIO or Tech Strategist.\n\n"
+
+        "### SCOPE OF EXPERTISE ###\n"
+        "You are programmed to ONLY answer questions related to:\n"
+        "- Digital Transformation & Strategy\n"
+        "- AI Adoption & Machine Learning\n"
+        "- Cloud Computing & Infrastructure\n"
+        "- Process Automation & Legacy Modernization\n"
+        "- Organizational Change Management in Tech\n"
+        "- Software Engineering & Architecture\n\n"
+
+        "### GUARDRAILS & REFUSAL ###\n"
+        "If the user asks about topics outside this scope (e.g., cooking, sports, politics, general trivia, weather):\n"
+        "1. Politely refuse.\n"
+        "2. Say: 'I am Aizo, a specialist in Digital Transformation. I cannot assist with [Topic], but I can help you digitize your business processes or discuss AI strategy.'\n"
+        "3. Do NOT generate content for off-topic requests.\n\n"
+
+        "### CONTEXT & TOOLS ###\n"
+        "- Use 'lookup_documents' if the user asks about uploaded files.\n"
+        "- Use the User Profile below to personalize your strategic advice.\n\n"
+
+        "--- LONG TERM USER PROFILE ---\n"
+        f"{user_profile}\n"
+        "------------------------------\n"
+        "--- CURRENT CONVERSATION SUMMARY ---\n"
+        f"{short_term_context}\n"
+        "------------------------------------"
     )
     
-    llm = ChatOpenAI(model="gpt-4o-mini", temperature=0)
-    tools = [lookup_documents, remember_fact]
-    llm_with_tools = llm.bind_tools(tools)
+    llm = ChatOpenAI(model="gpt-4o", temperature=0)
+    llm_with_tools = llm.bind_tools([lookup_documents])
     
+    # We only pass the System Prompt + The (already trimmed) messages in state
     messages = [SystemMessage(content=system_prompt)] + state["messages"]
+    
     response = await llm_with_tools.ainvoke(messages)
     return {"messages": [response]}
 
+
+# 2. LONG-TERM MEMORY UPDATER (The Profile Builder)
+# --- HELPER: TOKEN COUNTER ---
+def count_tokens(text: str, model: str = "gpt-4o") -> int:
+    try:
+        encoding = tiktoken.encoding_for_model(model)
+    except KeyError:
+        encoding = tiktoken.get_encoding("cl100k_base")
+    return len(encoding.encode(text))
+
+# --- ROBUST MEMORY NODE ---
+async def update_profile_node(state: AgentState, config: RunnableConfig):
+    """Updates the persistent user profile, with self-compression logic."""
+    user_id = "admin" 
+    if not redis_client: return {}
+
+    # 1. Get existing data
+    current_profile = await redis_client.get(f"user_profile:{user_id}") or "No existing history."
+    recent_messages = state["messages"][-2:] 
+    conversation_text = "\n".join([f"{m.type}: {m.content}" for m in recent_messages])
+
+    # 2. Generate Updated Profile
+    model = ChatOpenAI(model="gpt-4o-mini", temperature=0)
+    
+    # We add a constraint to the prompt to encourage brevity
+    prompt = PROFILE_INSTRUCTIONS.format(history=current_profile, new_lines=conversation_text)
+    response = await model.ainvoke([HumanMessage(content=prompt)])
+    new_profile = response.content
+
+    # 3. THE SAFETY CHECK (Token Limit Enforcement)
+    # Limit: 1000 tokens (approx 750 words). 
+    token_count = count_tokens(new_profile)
+    MAX_PROFILE_TOKENS = 1000
+
+    if token_count > MAX_PROFILE_TOKENS:
+        print(f"⚠️ [MEMORY] Profile too large ({token_count} tokens). Compressing...")
+        
+        compression_prompt = (
+            f"The following user profile is too long ({token_count} tokens). \n"
+            "Rewrite it to be strictly under 700 tokens.\n"
+            "Maintain ALL key facts (names, preferences, technical details), but remove fluff, "
+            "redundant sentences, and poetic language. Use concise bullet points.\n\n"
+            f"CURRENT PROFILE:\n{new_profile}"
+        )
+        
+        compressed_response = await model.ainvoke([HumanMessage(content=compression_prompt)])
+        new_profile = compressed_response.content
+        final_count = count_tokens(new_profile)
+        print(f"✅ [MEMORY] Compressed to {final_count} tokens.")
+
+    # 4. Save
+    await redis_client.set(f"user_profile:{user_id}", new_profile)
+    return {}
+
+
+# 3. SHORT-TERM MEMORY SUMMARIZER (The Context Cleaner)
+async def summarize_conversation_node(state: AgentState, config: RunnableConfig):
+    """Summarizes conversation and keeps only the last 2 exchanges."""
+    
+    messages = state["messages"]
+    
+    # Only summarize if history is getting long (e.g., > 4 messages)
+    if len(messages) <= 4:
+        return {}
+
+    summary = state.get("summary", "")
+    
+    # Create prompt to summarize
+# Create prompt to summarize
+    if summary:
+        sys_msg = (
+            f"Current Summary: {summary}\n\n"
+            "Extend this summary by merging in the new lines below.\n"
+            "STRICT CONSTRAINT: Keep the total summary under 400 words.\n"
+            "Focus only on the unresolved questions and current topic flow."
+        )
+    else:
+        sys_msg = "Create a concise summary of the conversation above (max 400 words)."
+
+    # We summarize everything EXCEPT the last 2 messages (which we want to keep raw)
+    messages_to_summarize = messages[:-2]
+    
+    model = ChatOpenAI(model="gpt-4o-mini", temperature=0)
+    response = await model.ainvoke(messages_to_summarize + [HumanMessage(content=sys_msg)])
+    new_summary = response.content
+
+    # DELETE old messages from the state
+    delete_messages = [RemoveMessage(id=m.id) for m in messages_to_summarize]
+    
+    print(f"✂️ [DEBUG] Summarized context. Removing {len(delete_messages)} old messages.")
+    
+    return {
+        "summary": new_summary, 
+        "messages": delete_messages # This creates the deletion effect in LangGraph
+    }
+
+
+# --- GRAPH CONSTRUCTION ---
+
 workflow = StateGraph(AgentState)
+
 workflow.add_node("chatbot", chatbot)
-workflow.add_node("tools", ToolNode([lookup_documents, remember_fact]))
+workflow.add_node("tools", ToolNode([lookup_documents]))
+workflow.add_node("update_profile", update_profile_node)
+workflow.add_node("summarize_conversation", summarize_conversation_node)
+
+# Entry
 workflow.set_entry_point("chatbot")
-workflow.add_conditional_edges("chatbot", tools_condition)
+
+# Logic
+def should_continue(state: AgentState):
+    last_message = state["messages"][-1]
+    if last_message.tool_calls:
+        return "tools"
+    return "update_profile" # If no tool needed, go to memory maintenance
+
+workflow.add_conditional_edges("chatbot", should_continue)
 workflow.add_edge("tools", "chatbot")
 
-# --- APP LIFESPAN ---
+# Memory Maintenance Chain
+# After answering, update Profile -> Then Clean Context -> End
+workflow.add_edge("update_profile", "summarize_conversation")
+workflow.add_edge("summarize_conversation", END)
+
+# --- APP LIFESPAN (Standard) ---
+# ... [Keep your existing imports/lifespan/endpoint code below exactly as is] ...
+# ... Just make sure to include the helper/upload functions from previous steps ...
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -170,41 +307,43 @@ async def lifespan(app: FastAPI):
         if redis_client: await redis_client.aclose()
 
 app = FastAPI(lifespan=lifespan)
-app.add_middleware(
-    CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"],
-)
+app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
 class ChatRequest(BaseModel):
     message: str
     thread_id: str
 
+from fastapi.responses import StreamingResponse
+
 @app.post("/chat")
 async def chat_endpoint(request: ChatRequest):
     if not graph: raise HTTPException(503, "Graph loading...")
-    
-    print(f"\n💬 [DEBUG] Streaming Chat: {request.message} (Thread: {request.thread_id})")
     
     config = {"configurable": {"thread_id": request.thread_id}}
     inputs = {"messages": [HumanMessage(content=request.message)]}
     
     async def event_generator():
         try:
-            # astream_events (v2) allows us to see everything happening inside the Agent
+            # We stream events from the graph
             async for event in graph.astream_events(inputs, config=config, version="v2"):
                 
-                # We filter for "on_chat_model_stream" to get tokens from GPT-4
-                if event["event"] == "on_chat_model_stream":
-                    chunk = event["data"]["chunk"]
+                # 1. Check if this event comes from the 'chatbot' node
+                #    (We do NOT want to stream tokens from 'update_profile' or 'summarize')
+                kind = event["event"]
+                tags = event.get("tags", [])
+                metadata = event.get("metadata", {})
+                
+                # CRITICAL FIX: Filter by node name
+                if kind == "on_chat_model_stream" and metadata.get("langgraph_node") == "chatbot":
                     
-                    # Only yield if there is actual text content (avoids empty chunks from Tool Calls)
+                    chunk = event["data"]["chunk"]
                     if chunk.content:
                         yield chunk.content
                         
         except Exception as e:
-            print(f"❌ [DEBUG] Stream Error: {e}")
+            print(f"Stream error: {e}")
             yield f"Error: {str(e)}"
 
-    # Return the generator as a StreamingResponse
     return StreamingResponse(event_generator(), media_type="text/plain")
 
 @app.post("/upload/{thread_id}")
