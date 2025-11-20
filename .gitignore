@@ -1,0 +1,5 @@
+venv
+.env
+chainlit.db
+chainlit.md
+db

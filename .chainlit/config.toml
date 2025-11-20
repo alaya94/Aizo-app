@@ -1,0 +1,44 @@
+[project]
+enable_telemetry = false
+user_env = []
+session_timeout = 3600
+cache = false
+allow_origins = ["*"]
+
+[features]
+prompt_playground = true
+unsafe_allow_html = false
+chat_history = true
+multi_modal = true
+latex = false
+auto_tag_thread = true
+
+[features.spontaneous_file_upload]
+    enabled = true
+    accept = ["*/*"]
+    max_files = 20
+    max_size_mb = 500
+
+[UI]
+name = "Chat Assistant"
+show_readme_as_default = true
+default_collapse_content = false
+default_expand_messages = true
+hide_cot = false
+custom_css = "/public/custom.css"
+
+[UI.theme]
+    default = "dark"
+    
+    [UI.theme.dark]
+    background = "#111827"
+    paper = "#1F2937"
+    
+    [UI.theme.dark.primary]
+        main = "#3B82F6"
+        dark = "#2563EB"
+        light = "#60A5FA"
+
+[meta]
+generated_by = "1.0.0"
+

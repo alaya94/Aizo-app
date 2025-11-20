@@ -1,0 +1,17 @@
+redis
+redis[hiredis]
+fastapi
+uvicorn
+chainlit
+langchain
+langchain-openai
+langchain-community
+langgraph
+langgraph-checkpoint-redis
+python-multipart
+chromadb
+tiktoken
+pypdf
+httpx
+python-dotenv
+literalai
