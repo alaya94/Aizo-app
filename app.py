@@ -25,6 +25,8 @@ from langgraph.graph.message import add_messages
 import base64
 import tiktoken
 
+from langchain_community.tools import TavilySearchResults
+
 load_dotenv(override=True)
 
 # --- CONFIG ---
@@ -90,7 +92,44 @@ def lookup_documents(query: str, config: RunnableConfig) -> str:
         return "\n\n".join([d.page_content for d in docs]) if docs else "No info found."
     except Exception as e:
         return f"Error: {e}"
-
+@tool
+def research_digital_trends(query: str) -> str:
+    """
+    Use this tool to find REAL-TIME statistics, trends, and news about Digital Transformation.
+    Useful for questions like 'What are the AI trends in 2025?' or 'Latest cloud adoption stats'.
+    Sources are restricted to trusted tech & consulting firms (Gartner, McKinsey, TechCrunch, etc.).
+    """
+    print(f"\n🌐 [DEBUG] Tool 'research_digital_trends' called: '{query}'")
+    
+    try:
+        # We limit the search to high-quality domains to ensure "Expert" quality
+        search_tool = TavilySearchResults(
+            max_results=3,
+            include_answer=True,
+            include_domains=[
+                "gartner.com", 
+                "mckinsey.com", 
+                "forrester.com", 
+                "bcg.com", 
+                "hbr.org", 
+                "techcrunch.com", 
+                "venturebeat.com",
+                "aws.amazon.com",
+                "azure.microsoft.com"
+            ]
+        )
+        # Execute the search
+        results = search_tool.invoke({"query": query})
+        
+        # Format results for the LLM
+        output = []
+        for res in results:
+            output.append(f"Source: {res.get('url')}\nContent: {res.get('content')}")
+            
+        return "\n\n".join(output)
+        
+    except Exception as e:
+        return f"Search Error: {e}"
 # --- STATE DEFINITION ---
 
 class AgentState(TypedDict):
@@ -155,8 +194,8 @@ async def chatbot(state: AgentState, config: RunnableConfig):
         "------------------------------------"
     )
     
-    llm = ChatOpenAI(model="gpt-4o", temperature=0)
-    llm_with_tools = llm.bind_tools([lookup_documents])
+    llm = ChatOpenAI(model="gpt-4o-mini", temperature=0)
+    llm_with_tools = llm.bind_tools([lookup_documents,research_digital_trends])
     
     # We only pass the System Prompt + The (already trimmed) messages in state
     messages = [SystemMessage(content=system_prompt)] + state["messages"]
@@ -167,7 +206,7 @@ async def chatbot(state: AgentState, config: RunnableConfig):
 
 # 2. LONG-TERM MEMORY UPDATER (The Profile Builder)
 # --- HELPER: TOKEN COUNTER ---
-def count_tokens(text: str, model: str = "gpt-4o") -> int:
+def count_tokens(text: str, model: str = "gpt-4o-mini") -> int:
     try:
         encoding = tiktoken.encoding_for_model(model)
     except KeyError:
@@ -266,9 +305,10 @@ async def summarize_conversation_node(state: AgentState, config: RunnableConfig)
 workflow = StateGraph(AgentState)
 
 workflow.add_node("chatbot", chatbot)
-workflow.add_node("tools", ToolNode([lookup_documents]))
+workflow.add_node("tools", ToolNode([lookup_documents, research_digital_trends]))
 workflow.add_node("update_profile", update_profile_node)
 workflow.add_node("summarize_conversation", summarize_conversation_node)
+
 
 # Entry
 workflow.set_entry_point("chatbot")
