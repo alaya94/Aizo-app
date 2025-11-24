@@ -32,7 +32,7 @@ async def chat_endpoint(request: ChatRequest):
                 metadata = event.get("metadata", {})
                 
                 # Only stream tokens from the chatbot node
-                if kind == "on_chat_model_stream" and metadata.get("langgraph_node") == "chatbot":
+                if kind == "on_chat_model_stream" and metadata.get("langgraph_node") in ["chatbot", "diagnosis"]:
                     chunk = event["data"]["chunk"]
                     if chunk.content:
                         yield chunk.content
@@ -42,3 +42,4 @@ async def chat_endpoint(request: ChatRequest):
             yield f"Error: {str(e)}"
 
     return StreamingResponse(event_generator(), media_type="text/plain")
+
