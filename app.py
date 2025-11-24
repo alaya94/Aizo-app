@@ -5,7 +5,7 @@ from typing import List, TypedDict, Annotated, Optional
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from dotenv import load_dotenv
 
 # LangChain / LangGraph Imports
@@ -24,8 +24,23 @@ from langgraph.prebuilt import ToolNode, tools_condition
 from langgraph.graph.message import add_messages
 import base64
 import tiktoken
+from typing import Literal
+# from langchain_community.tools import TavilySearchResults
+from langchain_tavily import TavilySearch
+# --- ADD THESE IMPORTS ---
+from fastapi.staticfiles import StaticFiles  # To serve the PDF files
+from reportlab.lib.pagesizes import letter
+from reportlab.pdfgen import canvas
+from reportlab.lib.styles import getSampleStyleSheet
+from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer
+import time
+from langsmith import traceable
+# --- UPDATE CONFIGURATION ---
+# Add a directory for generated reports
+DOWNLOAD_DIR = "./downloads"
+os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 
-from langchain_community.tools import TavilySearchResults
+# ... (Keep existing REDIS_URL, etc.) ...
 
 load_dotenv(override=True)
 
@@ -62,7 +77,22 @@ INSTRUCTIONS:
 - Merge new facts into the Current Profile.
 - Keep the output as a concise bulleted list.
 """
+# --- ROUTER SCHEMA ---
+# --- ROUTER SCHEMA ---
+class RouteQuery(BaseModel):
+    """Route the user's query to the most relevant datasource."""
+    # ✅ Add "generate_report" to this list
+    step: Literal["files", "web_search", "general_chat", "generate_report"] = Field(
+        ...,
+        description="Given a user question, choose to route it to web search, uploaded files, general chat, or report generation.",
+    )
+# --- STATE DEFINITION ---
 
+class AgentState(TypedDict):
+    # add_messages handles the append logic
+    messages: Annotated[List[BaseMessage], add_messages]
+    # summary holds the Short-Term context summary
+    summary: str
 # --- TOOLS (Unchanged) ---
 def count_tokens(text: str, model: str = "gpt-4o") -> int:
     try:
@@ -79,7 +109,53 @@ def get_vector_store(session_id: str):
             collection_name=f"collection_{session_id}"
         )
     return vector_stores[session_id]
-
+@traceable(name="Intent Router")
+async def router_node(state: AgentState, config: RunnableConfig):
+    """
+    Analyzes the user's last message and decides the best tool strategy.
+    """
+    print("🚦 [DEBUG] Router determining intent...")
+    messages = state["messages"]
+    last_msg = messages[-1].content
+    
+    llm = ChatOpenAI(model="gpt-4o-mini", temperature=0)
+    structured_llm = llm.with_structured_output(RouteQuery)
+    
+    # 1. Update the System Prompt to teach it about Reports
+    system = (
+        "You are a router. Your job is to classify the user's intent.\n"
+        "- If they want to 'generate a report', 'create a pdf', or 'download file' -> 'generate_report'.\n"
+        "- If they ask about 'this file', 'uploaded document', or specific project details -> 'files'.\n"
+        "- If they ask about 'trends', 'news', 'stats', '2025', 'market' -> 'web_search'.\n"
+        "- If they say 'hi', 'who are you', or ask general theoretical questions -> 'general_chat'."
+    )
+    
+    route = await structured_llm.ainvoke([
+        SystemMessage(content=system),
+        HumanMessage(content=last_msg)
+    ])
+    
+    step = route.step
+    print(f"   → Routing to: {step.upper()}")
+    
+    directive = ""
+    
+    # 2. Add the Logic for the New Intent
+    if step == "generate_report":
+        # Crucial: Give permission to Search FIRST, then Report
+        directive = (
+            "INTENT DETECTED: REPORT GENERATION. "
+            "Step 1: If you need data, use 'research_digital_trends' or 'lookup_documents' first. "
+            "Step 2: You MUST use the 'generate_report' tool to create the PDF."
+        )
+    elif step == "files":
+        directive = "INTENT DETECTED: FILE QUERY. You MUST use the 'lookup_documents' tool."
+    elif step == "web_search":
+        directive = "INTENT DETECTED: WEB RESEARCH. You MUST use the 'research_digital_trends' tool."
+    else:
+        directive = "INTENT DETECTED: GENERAL CONVERSATION. Do NOT use any tools. Just reply."
+        
+    return {"messages": [SystemMessage(content=directive)]}
 @tool
 def lookup_documents(query: str, config: RunnableConfig) -> str:
     """Search uploaded documents (PDFs, Word, Text) AND image descriptions."""
@@ -96,14 +172,11 @@ def lookup_documents(query: str, config: RunnableConfig) -> str:
 def research_digital_trends(query: str) -> str:
     """
     Use this tool to find REAL-TIME statistics, trends, and news about Digital Transformation.
-    Useful for questions like 'What are the AI trends in 2025?' or 'Latest cloud adoption stats'.
-    Sources are restricted to trusted tech & consulting firms (Gartner, McKinsey, TechCrunch, etc.).
     """
     print(f"\n🌐 [DEBUG] Tool 'research_digital_trends' called: '{query}'")
     
     try:
-        # We limit the search to high-quality domains to ensure "Expert" quality
-        search_tool = TavilySearchResults(
+        search_tool = TavilySearch(
             max_results=3,
             include_answer=True,
             include_domains=[
@@ -118,92 +191,214 @@ def research_digital_trends(query: str) -> str:
                 "azure.microsoft.com"
             ]
         )
-        # Execute the search
-        results = search_tool.invoke({"query": query})
-        
-        # Format results for the LLM
-        output = []
-        for res in results:
-            output.append(f"Source: {res.get('url')}\nContent: {res.get('content')}")
-            
-        return "\n\n".join(output)
-        
+
+        print("🔍 [DEBUG] Executing Tavily search request...")
+        response = search_tool.invoke({"query": query})
+
+        print("📦 [DEBUG] Raw Tavily response:")
+        print(response)
+
+        # --- FIX: Tavily returns a dict, and results are inside response["results"] ---
+        tavily_results = response.get("results", [])
+
+        if not tavily_results:
+            return "No results found."
+
+        formatted_outputs = []
+
+        for item in tavily_results:
+            url = item.get("url", "No URL")
+            content = item.get("content", "No Content")
+            formatted_outputs.append(f"Source: {url}\nContent: {content}")
+
+        print("✅ [DEBUG] Formatted results generated.")
+
+        return "\n\n".join(formatted_outputs)
+
     except Exception as e:
+        print("❌ [DEBUG] ERROR OCCURRED:", e)
         return f"Search Error: {e}"
-# --- STATE DEFINITION ---
 
-class AgentState(TypedDict):
-    # add_messages handles the append logic
-    messages: Annotated[List[BaseMessage], add_messages]
-    # summary holds the Short-Term context summary
-    summary: str
 
-# --- NODES ---
+from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, ListFlowable, ListItem
+from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+from reportlab.lib.enums import TA_JUSTIFY
+import re
+@tool
+def generate_report(topic: str, content: str) -> str:
+    """
+    Generates a professional PDF report. 
+    Parses Markdown (headers #, ##, ###, bold **, lists -) into a clean PDF layout.
+    """
+    print(f"📝 [DEBUG] Generating Formatted PDF: {topic}")
+    
+    try:
+        filename = f"Report_{int(time.time())}.pdf"
+        file_path = os.path.join(DOWNLOAD_DIR, filename)
+        
+        # 1. Setup Styles
+        styles = getSampleStyleSheet()
+        styles.add(ParagraphStyle(name='Justify', parent=styles['Normal'], alignment=TA_JUSTIFY, spaceAfter=12))
+        
+        story = []
+        
+        # 2. Add Main Title
+        story.append(Paragraph(topic, styles['Title']))
+        story.append(Spacer(1, 24))
+        
+        # 3. PARSER: Convert Markdown to ReportLab Flowables
+        lines = content.split('\n')
+        current_list = []
+        
+        def flush_list(buffer, story_obj):
+            if buffer:
+                story_obj.append(ListFlowable(buffer, bulletType='bullet', start='circle', leftIndent=20))
+                story_obj.append(Spacer(1, 12))
+                buffer.clear()
+        
+        for line in lines:
+            line = line.strip()
+            if not line: continue
+            
+            # --- Pre-processing: Bold and Italics ---
+            line = re.sub(r'\*\*(.*?)\*\*', r'<b>\1</b>', line)
+            line = re.sub(r'\*(.*?)\*', r'<i>\1</i>', line)
+            
+            # --- A. Handle Headers (H1, H2, H3, H4) ---
+            if line.startswith('# '):
+                flush_list(current_list, story)     # Ensure no list is pending
+                text = line.replace('# ', '')
+                story.append(Paragraph(text, styles['Heading1']))
+                story.append(Spacer(1, 12))
+                
+            elif line.startswith('## '):
+                flush_list(current_list, story)
+                text = line.replace('## ', '')
+                story.append(Paragraph(text, styles['Heading2']))
+                story.append(Spacer(1, 10))
 
-# 1. CHATBOT NODE (Consumes Memories)
+            # --- NEW: Handle Heading 3 (###) ---
+            elif line.startswith('### '):
+                flush_list(current_list, story)
+                text = line.replace('### ', '')
+                # ReportLab usually has Heading3, but we ensure it looks distinct
+                story.append(Paragraph(text, styles['Heading3']))
+                story.append(Spacer(1, 8))
+
+            # --- NEW: Handle Heading 4 (####) ---
+            elif line.startswith('#### '):
+                flush_list(current_list, story)
+                text = line.replace('#### ', '')
+                story.append(Paragraph(text, styles['Heading4']))
+                story.append(Spacer(1, 6))
+            
+            # --- B. Handle Bullet Points (- or *) ---
+            elif line.startswith('- ') or line.startswith('* '):
+                text = line[2:] 
+                current_list.append(ListItem(Paragraph(text, styles['Normal'])))
+            
+            # --- C. Handle Numbered Lists (1. ) ---
+            elif re.match(r'^\d+\.', line):
+                text = line.split('.', 1)[1].strip()
+                current_list.append(ListItem(Paragraph(text, styles['Normal'])))
+
+            # --- D. Normal Paragraphs ---
+            else:
+                flush_list(current_list, story) # Paragraph breaks the list
+                story.append(Paragraph(line, styles['Justify']))
+        
+        # Final flush at end of document
+        flush_list(current_list, story)
+
+        # 4. Build PDF
+        doc = SimpleDocTemplate(file_path, pagesize=letter)
+        doc.build(story)
+        
+        download_url = f"http://localhost:{PORT}/downloads/{filename}"
+        return f"✅ Report generated successfully! Download here: {download_url}"
+
+    except Exception as e:
+        print(f"❌ PDF Error: {e}")
+        return f"Error generating report: {e}"
+@traceable
 async def chatbot(state: AgentState, config: RunnableConfig):
-    # Helper to get User ID (for Profile) and Thread ID (for Vector Store)
     conf = config.get("configurable", {})
     thread_id = conf.get("thread_id")
-    user_id = "admin" # In a real app, pass this in config. For now, we default to admin.
+    user_id = "admin"
 
-    # A. FETCH LONG-TERM PROFILE (User Scoped)
+    # A. FETCH LONG-TERM PROFILE
     user_profile = ""
     if redis_client:
-        # Note: Key is based on USER_ID, not THREAD_ID. This is shared memory!
-        user_profile = await redis_client.get(f"user_profile:{user_id}")
-        if not user_profile:
-            user_profile = "No profile yet."
+        user_profile = await redis_client.get(f"user_profile:{user_id}") or "No profile yet."
     
-    # B. FETCH SHORT-TERM SUMMARY (Thread Scoped)
+    # B. FETCH SHORT-TERM SUMMARY
     short_term_context = state.get("summary", "")
 
-    # C. CONSTRUCT SYSTEM PROMPT
-# ... inside chatbot function ...
-
-    # C. CONSTRUCT SYSTEM PROMPT (THE AIZO PERSONALITY)
+    # C. SYSTEM PROMPT
     system_prompt = (
         "### IDENTITY ###\n"
-        "Your name is **Aizo**. You are a Senior Consultant and Expert in **Digital Transformation**.\n"
-        "You are professional, insightful, and strategic. You speak with the authority of a CIO or Tech Strategist.\n\n"
-
-        "### SCOPE OF EXPERTISE ###\n"
-        "You are programmed to ONLY answer questions related to:\n"
-        "- Digital Transformation & Strategy\n"
-        "- AI Adoption & Machine Learning\n"
-        "- Cloud Computing & Infrastructure\n"
-        "- Process Automation & Legacy Modernization\n"
-        "- Organizational Change Management in Tech\n"
-        "- Software Engineering & Architecture\n\n"
-
-        "### GUARDRAILS & REFUSAL ###\n"
-        "If the user asks about topics outside this scope (e.g., cooking, sports, politics, general trivia, weather):\n"
-        "1. Politely refuse.\n"
-        "2. Say: 'I am Aizo, a specialist in Digital Transformation. I cannot assist with [Topic], but I can help you digitize your business processes or discuss AI strategy.'\n"
-        "3. Do NOT generate content for off-topic requests.\n\n"
-
-        "### CONTEXT & TOOLS ###\n"
-        "- Use 'lookup_documents' if the user asks about uploaded files.\n"
-        "- Use the User Profile below to personalize your strategic advice.\n\n"
-
-        "--- LONG TERM USER PROFILE ---\n"
+        "Your name is **Aizo**. You are a Senior Consultant in **Digital Transformation**.\n\n"
+        "### TOOLS ###\n"
+        "1. **Knowledge:** Use 'lookup_documents' for files.\n"
+        "2. **Research:** Use 'research_digital_trends' for live web data.\n"
+        "3. **Reporting:** Use 'generate_report' ONLY when the user explicitly asks to 'download', 'create a file', or 'generate a report'.\n"
+        "   - When using this tool, pass a professional title and a DETAILED summary of the advice given so far.\n\n"
+        "### USER PROFILE ###\n"
         f"{user_profile}\n"
         "------------------------------\n"
-        "--- CURRENT CONVERSATION SUMMARY ---\n"
         f"{short_term_context}\n"
-        "------------------------------------"
     )
     
+    # --- STABILIZATION FIX ---
     llm = ChatOpenAI(model="gpt-4o-mini", temperature=0)
-    llm_with_tools = llm.bind_tools([lookup_documents,research_digital_trends])
     
-    # We only pass the System Prompt + The (already trimmed) messages in state
+    # bind_tools(..., parallel_tool_calls=False) FORCES the AI to be careful/sequential
+    llm_with_tools = llm.bind_tools(
+        [lookup_documents, research_digital_trends, generate_report], # <--- Added here
+        parallel_tool_calls=False 
+    )
+    
     messages = [SystemMessage(content=system_prompt)] + state["messages"]
     
+    # --- DEBUG: SEE WHAT IS HAPPENING ---
     response = await llm_with_tools.ainvoke(messages)
+    
+    if response.tool_calls:
+        print(f"\n🛠️ [DEBUG] AI is calling tools: {response.tool_calls}")
+    
     return {"messages": [response]}
 
+# --- HELPER: IMAGE SUMMARIZER ---
+async def describe_image(file_path: str) -> str:
+    """
+    Uses GPT-4o-mini to look at the image and describe it textually.
+    """
+    print(f"   [DEBUG] Vision processing started for: {file_path}")
+    
+    try:
+        # 1. Open file safely
+        with open(file_path, "rb") as image_file:
+            encoded_string = base64.b64encode(image_file.read()).decode('utf-8')
+        
+        # 2. Call OpenAI Vision
+        vision_llm = ChatOpenAI(model="gpt-4o-mini", max_tokens=1000)
+        
+        msg = HumanMessage(
+            content=[
+                {"type": "text", "text": "Analyze this image. Extract all visible text verbatim. Describe charts/graphs in detail."},
+                {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{encoded_string}"}}
+            ]
+        )
+        
+        print("   [DEBUG] Sending image to OpenAI...")
+        res = await vision_llm.ainvoke([msg])
+        print("   [DEBUG] Vision response received.")
+        return res.content
 
+    except Exception as e:
+        print(f"❌ [VISION ERROR] Could not analyze image: {e}")
+        # Fallback: Return a placeholder so the whole upload doesn't crash
+        return "Error analyzing image. (Check backend logs for details)"
 # 2. LONG-TERM MEMORY UPDATER (The Profile Builder)
 # --- HELPER: TOKEN COUNTER ---
 def count_tokens(text: str, model: str = "gpt-4o-mini") -> int:
@@ -260,71 +455,95 @@ async def update_profile_node(state: AgentState, config: RunnableConfig):
 
 # 3. SHORT-TERM MEMORY SUMMARIZER (The Context Cleaner)
 async def summarize_conversation_node(state: AgentState, config: RunnableConfig):
-    """Summarizes conversation and keeps only the last 2 exchanges."""
+    """Summarizes conversation while PRESERVING tool call/response integrity."""
     
     messages = state["messages"]
     
-    # Only summarize if history is getting long (e.g., > 4 messages)
-    if len(messages) <= 4:
+    # Only summarize if history is getting long
+    if len(messages) <= 6:  # Increased threshold
         return {}
 
     summary = state.get("summary", "")
     
-    # Create prompt to summarize
-# Create prompt to summarize
+    # CRITICAL FIX: Find safe truncation point
+    # Never delete a tool_calls message without its corresponding ToolMessage
+    safe_delete_index = 0
+    i = 0
+    while i < len(messages) - 4:  # Keep at least last 4 messages
+        msg = messages[i]
+        
+        # If this is an AI message with tool_calls, skip it AND the next message (tool response)
+        if hasattr(msg, 'tool_calls') and msg.tool_calls:
+            i += 2  # Skip both the tool_calls and the tool response
+            continue
+        
+        # If this is a ToolMessage, it should have been handled above, but skip anyway
+        if msg.type == "tool":
+            i += 1
+            continue
+            
+        # Safe to potentially delete this message
+        safe_delete_index = i + 1
+        i += 1
+    
+    # Only proceed if we have messages we can safely delete
+    messages_to_summarize = messages[:safe_delete_index]
+    
+    if len(messages_to_summarize) < 2:
+        return {}  # Nothing safe to summarize
+    
+    # Create summary
     if summary:
         sys_msg = (
             f"Current Summary: {summary}\n\n"
             "Extend this summary by merging in the new lines below.\n"
-            "STRICT CONSTRAINT: Keep the total summary under 400 words.\n"
-            "Focus only on the unresolved questions and current topic flow."
+            "Keep under 400 words. Focus on key topics and decisions."
         )
     else:
         sys_msg = "Create a concise summary of the conversation above (max 400 words)."
 
-    # We summarize everything EXCEPT the last 2 messages (which we want to keep raw)
-    messages_to_summarize = messages[:-2]
-    
     model = ChatOpenAI(model="gpt-4o-mini", temperature=0)
-    response = await model.ainvoke(messages_to_summarize + [HumanMessage(content=sys_msg)])
+    
+    # Filter out tool messages for summarization (they don't summarize well)
+    summarizable = [m for m in messages_to_summarize if m.type in ["human", "ai"] and not (hasattr(m, 'tool_calls') and m.tool_calls)]
+    
+    if not summarizable:
+        return {}
+        
+    response = await model.ainvoke(summarizable + [HumanMessage(content=sys_msg)])
     new_summary = response.content
 
-    # DELETE old messages from the state
+    # Delete old messages
     delete_messages = [RemoveMessage(id=m.id) for m in messages_to_summarize]
     
     print(f"✂️ [DEBUG] Summarized context. Removing {len(delete_messages)} old messages.")
     
     return {
         "summary": new_summary, 
-        "messages": delete_messages # This creates the deletion effect in LangGraph
+        "messages": delete_messages
     }
-
-
-# --- GRAPH CONSTRUCTION ---
 
 workflow = StateGraph(AgentState)
 
+# Add Nodes
+workflow.add_node("router", router_node)
 workflow.add_node("chatbot", chatbot)
-workflow.add_node("tools", ToolNode([lookup_documents, research_digital_trends]))
+workflow.add_node("tools", ToolNode([lookup_documents, research_digital_trends,generate_report]))
 workflow.add_node("update_profile", update_profile_node)
 workflow.add_node("summarize_conversation", summarize_conversation_node)
 
+workflow.set_entry_point("router")
+workflow.add_edge("router", "chatbot")
 
-# Entry
-workflow.set_entry_point("chatbot")
-
-# Logic
+# FIXED: Only go to memory nodes when conversation is COMPLETE (no more tool calls)
 def should_continue(state: AgentState):
     last_message = state["messages"][-1]
-    if last_message.tool_calls:
+    if hasattr(last_message, 'tool_calls') and last_message.tool_calls:
         return "tools"
-    return "update_profile" # If no tool needed, go to memory maintenance
+    return "update_profile"  # Only update memory when done with tools
 
 workflow.add_conditional_edges("chatbot", should_continue)
-workflow.add_edge("tools", "chatbot")
-
-# Memory Maintenance Chain
-# After answering, update Profile -> Then Clean Context -> End
+workflow.add_edge("tools", "chatbot")  # Loop back to chatbot after tools
 workflow.add_edge("update_profile", "summarize_conversation")
 workflow.add_edge("summarize_conversation", END)
 
@@ -349,7 +568,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(lifespan=lifespan)
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
-
+app.mount("/downloads", StaticFiles(directory=DOWNLOAD_DIR), name="downloads")
 class ChatRequest(BaseModel):
     message: str
     thread_id: str

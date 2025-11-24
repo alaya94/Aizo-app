@@ -5,3 +5,4 @@ chainlit.md
 db
 test_db.ipynb
 _pycache_
+app.py
